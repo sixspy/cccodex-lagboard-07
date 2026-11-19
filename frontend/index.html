@@ -57,10 +57,14 @@ createApp({
   setup(){
     const token=ref(localStorage.getItem('lagboard_token')||'');
     const user=ref(localStorage.getItem('lagboard_user')||'');
+    const role=ref(localStorage.getItem('lagboard_role')||'');
+    const canWrite=ref(false);
+    const policy=ref(null);
+    const audits=ref([]);
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const sources=ref([]), arrivals=ref([]), catchups=ref([]);
     const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00'});
-    const nav=['到达登记','滞后分级','补齐恢复'];
+    const nav=['到达登记','滞后分级','补齐恢复','审计列表','权限说明'];
     const frozen=computed(()=>sources.value.filter(s=>s.output_mode==='冻结').length);
     const degraded=computed(()=>sources.value.filter(s=>s.output_mode==='降级只读').length);
     function modeClass(m){return m==='冻结'?'bad':(m==='降级只读'?'warn':'ok');}
@@ -69,11 +73,12 @@ createApp({
       err.value='';
       const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:username.value,password:password.value})});
       const j=await r.json(); if(!r.ok){err.value=j.detail||'登录失败';return;}
-      token.value=j.token; user.value=j.username;
-      localStorage.setItem('lagboard_token',j.token); localStorage.setItem('lagboard_user',j.username);
+      token.value=j.token; user.value=j.username; role.value=j.role;
+      localStorage.setItem('lagboard_token',j.token); localStorage.setItem('lagboard_user',j.username); localStorage.setItem('lagboard_role',j.role);
       await refresh();
     }
-    function logout(){token.value='';user.value='';localStorage.removeItem('lagboard_token');localStorage.removeItem('lagboard_user');}
+    function logout(){token.value='';user.value='';role.value='';canWrite.value=false;policy.value=null;
+      ['lagboard_token','lagboard_user','lagboard_role'].forEach(k=>localStorage.removeItem(k));}
     async function loadJson(url){
       const r=await fetch(url,{headers:auth()});
       const j=await r.json().catch(()=>({}));
@@ -82,23 +87,33 @@ createApp({
     }
     async function refresh(){
       if(!token.value) return;
+      const p=await loadJson('/api/auth-policy'); if(p===null) return;
+      policy.value=p; canWrite.value=!!p.can_write; role.value=p.role; user.value=p.username;
       const s=await loadJson('/api/sources'); if(s===null) return;
       sources.value=Array.isArray(s.items)?s.items:[];
       const a=await loadJson('/api/arrivals'); if(a===null) return;
       arrivals.value=Array.isArray(a.items)?a.items:[];
       const c=await loadJson('/api/catchups'); if(c===null) return;
       catchups.value=Array.isArray(c.items)?c.items:[];
+      const au=await loadJson('/api/audit'); if(au===null) return;
+      audits.value=Array.isArray(au.items)?au.items:[];
       if(sources.value.length && !form.value.source) form.value.source=sources.value[0].name;
     }
     async function recordArrival(){
       actionErr.value='';
+      if(!canWrite.value){actionErr.value='只读令牌禁止写入：服务端已拦截（403），正式侧零写入。';return;}
       const r=await fetch('/api/arrivals',{method:'POST',headers:auth(),body:JSON.stringify(form.value)});
       const j=await r.json(); actionErr.value=r.ok?(`滞后 ${j.lag_minutes} 分 · ${j.level} · ${j.output_mode}`):(j.detail||'失败');
       await refresh();
     }
-    async function doCatchup(name){await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});await refresh();}
+    async function doCatchup(name){
+      if(!canWrite.value) return; // 体验层隐藏；真正裁决在服务端
+      const r=await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});
+      if(!r.ok){actionErr.value=(await r.json().catch(()=>({}))).detail||'解冻被拒绝';}
+      await refresh();
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
+    return {token,user,role,canWrite,policy,audits,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
   },
   template:`
   <div v-if="!token" class="login">
@@ -116,7 +131,12 @@ createApp({
         <span>SLA {{s.sla_minutes}} 分钟</span>
         <div class="mode" :class="modeClass(s.output_mode)">{{s.output_mode}}</div>
       </div>
-      <div style="margin-top:18px;font-size:12px;color:#9db0cc">{{user}} · <a href="#" style="color:#fff" @click.prevent="logout">退出</a></div>
+      <div style="margin-top:18px;font-size:12px;color:#9db0cc">
+        <div style="margin-bottom:6px">
+          <span class="mode" :class="canWrite?'ok':'warn'">{{canWrite?'管理可写':'只读·零写'}}</span>
+        </div>
+        {{user}}（{{role}}） · <a href="#" style="color:#fff" @click.prevent="logout">退出</a>
+      </div>
     </aside>
     <main>
       <div class="bar">
@@ -128,13 +148,15 @@ createApp({
         <div class="card"><h3>降级只读</h3><strong>{{degraded}}</strong></div>
       </div>
       <div class="card" v-show="tab===0">
-        <h3 style="margin-bottom:8px">登记到达</h3>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
-          <div><label>源</label><select v-model="form.source"><option v-for="s in sources" :value="s.name">{{s.name}}</option></select></div>
-          <div><label>源时钟</label><input v-model="form.source_clock"/></div>
-          <div><label>摄入时钟</label><input v-model="form.ingest_clock"/></div>
-        </div>
-        <button class="primary" @click="recordArrival">计算滞后并更新输出态</button>
+        <h3 style="margin-bottom:8px">登记到达 <span v-if="!canWrite" class="mode warn" style="font-size:11px">只读：仅服务端裁决，禁止写入</span></h3>
+        <fieldset :disabled="!canWrite" style="border:0;margin:0;padding:0">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+            <div><label>源</label><select v-model="form.source"><option v-for="s in sources" :value="s.name">{{s.name}}</option></select></div>
+            <div><label>源时钟</label><input v-model="form.source_clock"/></div>
+            <div><label>摄入时钟</label><input v-model="form.ingest_clock"/></div>
+          </div>
+          <button class="primary" @click="recordArrival">计算滞后并更新输出态</button>
+        </fieldset>
         <div class="err">{{actionErr}}</div>
         <div class="timeline" style="margin-top:16px">
           <div class="item" v-for="a in (arrivals||[]).slice(0,8)" :key="a.id">
@@ -144,18 +166,42 @@ createApp({
         </div>
       </div>
       <div class="card" v-show="tab===1">
-        <h3>分级规则</h3>
+        <h3 style="margin-bottom:8px">分级规则 <span v-if="!canWrite" class="mode warn" style="font-size:11px">只读：解冻入口已隐藏，服务端同时拦截</span></h3>
         <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。</p>
-        <table><thead><tr><th>源</th><th>SLA</th><th>输出态</th><th></th></tr></thead>
+        <table><thead><tr><th>源</th><th>SLA</th><th>输出态</th><th v-if="canWrite"></th></tr></thead>
         <tbody><tr v-for="s in sources" :key="'g'+s.id">
           <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td>
-          <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button></td>
+          <td v-if="canWrite"><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button></td>
         </tr></tbody></table>
       </div>
       <div class="card" v-show="tab===2">
-        <h3>补齐记录</h3>
-        <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
-        <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+        <h3>补齐记录（补采队列）</h3>
+        <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>操作人</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.operator}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+        <p v-if="!catchups.length" style="color:#64748b;font-size:12px">暂无正式补齐记录；越权解冻不会在此产生行。</p>
+      </div>
+      <div class="card" v-show="tab===3">
+        <h3>审计列表</h3>
+        <table><thead><tr><th>操作人</th><th>动作</th><th>对象</th><th>结果</th><th>争用</th><th>说明</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="a in audits" :key="a.id">
+          <td>{{a.actor}}</td><td>{{a.action}}</td><td>{{a.target}}</td>
+          <td><span class="mode" :class="a.result==='放行'?'ok':(a.result==='越权拦截'?'bad':'warn')">{{a.result}}</span></td>
+          <td>{{a.contended?'后交争用':'—'}}</td><td style="color:#64748b">{{a.note}}</td><td>{{a.created_at}}</td>
+        </tr></tbody></table>
+        <p v-if="!audits.length" style="color:#64748b;font-size:12px">暂无审计记录。</p>
+      </div>
+      <div class="card" v-show="tab===4">
+        <h3>权限说明（权限附页 · 不另设鉴权台）</h3>
+        <table v-if="policy">
+          <tbody>
+            <tr><td>锁定路径</td><td><b>甲</b>：{{policy.zero_write_rule}}（当天钉死，禁止改口混用乙路径）</td></tr>
+            <tr><td>当前账号</td><td>{{policy.username}}（{{policy.role}}）</td></tr>
+            <tr><td>是否可写</td><td>{{policy.can_write?'是（管理角色，可解冻/登记）':'否（只读令牌，写路径服务端 403，正式侧零写入）'}}</td></tr>
+            <tr><td>可用写动作</td><td>{{policy.write_actions.length?policy.write_actions.join('、'):'无'}}</td></tr>
+            <tr><td>并发策略</td><td>解冻全程占鉴权锁；只读与管理同时打解冻，后交一路只留「鉴权解冻争用」审计痕</td></tr>
+          </tbody>
+        </table>
+        <p style="color:#64748b;font-size:12px;margin-top:8px">前端隐藏按钮仅为体验，最终鉴权在服务端写路径裁决；只读令牌无法改动任何输出态。</p>
       </div>
     </main>
   </div>`
